@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# CI de Terraform: formato y validacion
+# ---------------------------------------------------------------------------
+# Este workflow NO necesita credenciales de AWS. Solo revisa que el codigo este
+# bien formateado y sea internamente coherente. El `terraform plan`, que si
+# necesita hablar con AWS, llega en la Fase 5 con autenticacion por OIDC.
+#
+# Correrlo sin llaves tiene una ventaja concreta: es seguro ejecutarlo sobre un
+# Pull Request venga de donde venga, incluido un fork de un desconocido.
+# ---------------------------------------------------------------------------
+
+name: Terraform CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Permisos minimos. Por defecto GitHub concede escritura sobre el repositorio a
+# cada workflow; aqui solo hace falta leer el codigo.
+permissions:
+  contents: read
+
+# Si llegan varios commits seguidos al mismo PR, cancela la corrida anterior en
+# vez de acumular una cola. Ahorra minutos de CI y da respuesta mas rapida.
+concurrency:
+  group: terraform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validar ${{ matrix.stack }}
+    runs-on: ubuntu-latest
+
+    # Los dos stacks se validan por separado y en paralelo, porque son
+    # configuraciones independientes con su propio backend y sus propios
+    # proveedores. Si uno falla, el otro sigue: `fail-fast: false`.
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [bootstrap, infra]
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.stack }}
+
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Fijada a proposito: si GitHub cambia la version por defecto, el
+          # resultado del CI no debe cambiar sin que nadie lo haya decidido.
+          terraform_version: 1.15.8
+          # Desactiva el envoltorio que setup-terraform pone alrededor del
+          # binario. Sin esto, la salida de los comandos viene contaminada y
+          # los codigos de error no se propagan bien.
+          terraform_wrapper: false
+
+      - name: Comprobar formato canonico
+        # `fmt -check` no reformatea: falla si el archivo no esta en su forma
+        # canonica. Asi ningun PR se convierte en una discusion sobre espacios.
+        run: terraform fmt -check -recursive -diff
+
+      - name: Inicializar sin backend
+        # -backend=false descarga los proveedores pero NO se conecta al bucket
+        # de estado. Es lo que permite validar sin credenciales de AWS.
+        run: terraform init -backend=false -input=false
+
+      - name: Validar la configuracion
+        # Revisa sintaxis, tipos, referencias a variables inexistentes y
+        # argumentos que el proveedor no conoce. No contacta a AWS.
+        run: terraform validate -no-color
