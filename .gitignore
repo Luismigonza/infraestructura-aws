@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+# Proveedores y modulos descargados: se reconstruyen con `terraform init`.
+.terraform/
+.terraform.lock.hcl.bak
+
+# Estado local. NUNCA debe llegar al repositorio: contiene, en texto plano,
+# todo lo que Terraform sabe de la infraestructura, incluidas contrasenas.
+# En este proyecto el estado real vive en S3 (ver infra/backend.tf); estos
+# archivos solo aparecen por accidente o durante el bootstrap.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Archivos de variables con valores reales. Solo se versiona el .example.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Planes guardados: son binarios y pueden contener valores sensibles.
+*.tfplan
+plan.out
+tfplan*
+
+# Salidas de crash de Terraform
+crash.log
+crash.*.log
+
+# ---------------------------------------------------------------------------
+# Credenciales y secretos
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+aws-credentials*
+
+# ---------------------------------------------------------------------------
+# Sistema operativo y editores
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ---------------------------------------------------------------------------
+# Aplicacion de ejemplo
+# ---------------------------------------------------------------------------
+node_modules/
+__pycache__/
+*.pyc
+
+# Configuracion del backend generada por el stack de bootstrap.
+# Es especifica de cada cuenta de AWS, por eso no se versiona.
+backend.hcl

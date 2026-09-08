@@ -1,0 +1,9 @@
+# Copia este archivo a terraform.tfvars y ajusta lo que necesites.
+# terraform.tfvars esta en .gitignore: nunca se versiona.
+#
+# En CI no existe terraform.tfvars: alli las credenciales llegan por rol IAM y
+# los valores por defecto de variables.tf son suficientes.
+
+aws_profile = "infra-aws"
+aws_region  = "us-east-1"
+environment = "dev"

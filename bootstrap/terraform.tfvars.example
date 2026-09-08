@@ -1,0 +1,7 @@
+# Copia este archivo a terraform.tfvars y ajusta los valores.
+# terraform.tfvars esta en .gitignore: nunca se versiona.
+
+budget_alert_email = "tu-correo@ejemplo.com"
+aws_profile        = "infra-aws"
+aws_region         = "us-east-1"
+monthly_budget_usd = "10"
