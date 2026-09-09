@@ -5,8 +5,9 @@ Nada se crea a mano en la consola: si no está en un archivo `.tf`, no existe.
 Los cambios de infraestructura se revisan en Pull Requests igual que el código
 de una aplicación, y se aplican solos cuando alguien los aprueba.
 
-> **Estado:** en construcción. Fases 1 a 4 de 6 completadas.
-> Ver [Hoja de ruta](#hoja-de-ruta).
+> **Estado:** completo. La aplicación se despliega con un `terraform apply`,
+> los cambios de infraestructura pasan por Pull Request con el plan comentado, y
+> el ambiente entero se destruye con un comando.
 
 ---
 
@@ -59,6 +60,33 @@ Las subnets privadas son `/20` (4.091 direcciones usables) porque cada tarea de
 Fargate consume una IP propia; las públicas son `/24` (251) porque solo alojan
 el balanceador y el NAT. AWS reserva 5 direcciones en cada subnet, de ahí que no
 sean 4.096 y 256.
+
+### Verificación de la alta disponibilidad
+
+```
+AZ            IP privada      Estado    En el balanceador
+us-east-1a    10.42.12.13     RUNNING   healthy
+us-east-1b    10.42.26.251    RUNNING   healthy
+```
+
+Auto scaling en `min 2 / max 3`, por uso medio de CPU al 60 %. Si `us-east-1a`
+cayera entera, el balanceador seguiría sirviendo desde `1b`.
+
+### Verificación de la cadena completa
+
+```
+$ curl http://infra-aws-dev-alb-....us-east-1.elb.amazonaws.com/db
+{
+  "conectado": true,
+  "version": "PostgreSQL 17.11 on x86_64-pc-linux-gnu...",
+  "base": "appdb",
+  "momento": "2026-09-09T17:40:54.692Z"
+}
+```
+
+Esa respuesta demuestra el recorrido entero: internet → balanceador en subnet
+pública → tarea de Fargate en subnet privada → PostgreSQL en otra subnet
+privada, con una credencial que ningún humano ha visto.
 
 ---
 
@@ -469,7 +497,7 @@ gh variable set APP_URL         --body "<app_url>"
 | **NAT Gateway** | **~32 USD/mes** — el componente caro, no está en capa gratuita |
 | Application Load Balancer | ~16 USD/mes |
 | RDS `db.t3.micro` | gratis el primer año, luego ~13 USD/mes |
-| ECS Fargate (1 tarea mínima) | ~9 USD/mes |
+| ECS Fargate (2 tareas mínimas, una por AZ) | ~18 USD/mes |
 | S3 + DynamoDB (estado) | céntimos |
 | AWS Budgets | gratis |
 
@@ -528,55 +556,159 @@ Responde `yes` cuando pregunte si quiere copiar el estado existente. Responder
 `no` haría que Terraform se olvidara de los recursos recién creados, que
 seguirían existiendo y cobrando.
 
-### 3. Aplicar el stack principal
+> El `terraform.tfvars` del bootstrap necesita también los datos de tu
+> repositorio de GitHub, incluidos los **IDs numéricos**. No son opcionales:
+> GitHub emite el sujeto del token OIDC como
+> `repo:owner@<owner_id>/repo@<repo_id>:contexto`, y sin ellos la autenticación
+> del pipeline falla. Obténlos con:
+>
+> ```bash
+> gh api repos/OWNER/REPO --jq '"owner_id=\(.owner.id) repo_id=\(.id)"'
+> ```
 
-El bootstrap dejó generado `infra/backend.hcl` con los datos de **tu** cuenta.
+### 3. Crear el repositorio de imágenes y publicar la primera
+
+Este paso tiene un orden obligatorio. El servicio de ECS arranca tareas que
+descargan una imagen de ECR, pero ECR lo crea Terraform: aplicar todo de una vez
+deja el servicio apuntando a una imagen inexistente y las tareas entran en bucle
+de fallos.
 
 ```bash
 cd ../infra
 cp terraform.tfvars.example terraform.tfvars
 terraform init -backend-config backend.hcl
+
+# Solo el repositorio de imágenes (arrastra el balanceador por dependencia)
+terraform apply -target module.compute.aws_ecr_repository.app
+```
+
+Construye y sube la imagen al repositorio recién creado:
+
+```bash
+REPO=$(terraform output -raw ecr_repository_url)
+
+aws ecr get-login-password --region us-east-1 --profile infra-aws   | docker login --username AWS --password-stdin "${REPO%%/*}"
+
+docker build --platform linux/amd64 -t "$REPO:latest" ../app
+docker push "$REPO:latest"
+```
+
+### 4. Aplicar el resto
+
+```bash
 terraform plan -out tfplan
 terraform apply tfplan
 ```
 
-La URL de la aplicación sale como output al terminar.
+La URL de la aplicación sale como output al terminar:
+
+```bash
+terraform output -raw app_url
+```
+
+Las tareas tardan un par de minutos en arrancar, descargar la imagen y pasar el
+health check. Para esperar a que el servicio esté listo:
+
+```bash
+aws ecs wait services-stable   --cluster "$(terraform output -raw ecs_cluster_name)"   --services "$(terraform output -raw ecs_service_name)"   --profile infra-aws
+```
+
+Comprueba que la cadena completa funciona:
+
+```bash
+curl "$(terraform output -raw app_url)/db"
+```
+
+Debe responder con la versión de PostgreSQL, lo que demuestra que la petición
+llegó desde internet al balanceador, de ahí a una tarea en una subnet privada, y
+de ahí a la base de datos en otra subnet privada.
+
+### 5. Conectar el pipeline *(opcional)*
+
+Si además quieres el flujo de GitOps, sigue
+[Configuración necesaria en GitHub](#configuración-necesaria-en-github).
 
 ---
 
 ## Cómo destruir el ambiente por completo
 
-**El orden importa.** El stack principal primero; el bootstrap después, porque
-guarda el estado de todo.
+**El orden importa.** El stack principal primero; el bootstrap al final, porque
+guarda el estado de todo lo demás.
+
+### 1. El stack principal
 
 ```bash
 cd infra
 terraform destroy
 ```
 
-Para el bootstrap hay un detalle: guarda su propio estado dentro del bucket que
-va a borrar. Hay que traerlo de vuelta al disco antes de destruirlo.
+Tarda entre 8 y 12 minutos, y la mayor parte se va en tres esperas propias de
+AWS: el balanceador drena las conexiones abiertas, RDS borra la instancia, y el
+NAT Gateway libera su interfaz de red.
+
+No hace falta vaciar nada a mano. Tres ajustes puestos a propósito lo permiten,
+y los tres están documentados arriba: `force_delete` en ECR (el repositorio se
+borra con imágenes dentro), `skip_final_snapshot` en RDS (no exige instantánea
+final) y `enable_deletion_protection = false` en el balanceador.
+
+### 2. El bootstrap
+
+Aquí hay un detalle: el bootstrap guarda su propio estado **dentro del bucket
+que va a borrar**. Si se destruyera tal cual, Terraform borraría el bucket y
+después intentaría escribir en él el estado final. Hay que traerlo al disco
+primero.
 
 ```bash
 cd ../bootstrap
 
 # 1. Comenta la línea `backend "s3" {}` en versions.tf
-# 2. Trae el estado de vuelta a local:
+# 2. Trae el estado de vuelta a tu máquina:
 terraform init -migrate-state
 
 # 3. Ahora sí:
 terraform destroy
 ```
 
-Comprueba que no quedó nada huérfano:
+Esto borra el bucket de estado, la tabla de cerrojo, la alerta de presupuesto y
+el rol de GitHub Actions con su proveedor OIDC.
+
+### 3. Comprobar que no quedó nada huérfano
+
+Un ambiente que se cree destruido pero deja recursos sueltos sigue cobrando.
+Este bloque revisa **todo** lo que el proyecto crea:
 
 ```bash
-aws ec2 describe-vpcs --profile infra-aws --query 'Vpcs[?IsDefault==`false`]'
-aws rds describe-db-instances --profile infra-aws --query 'DBInstances[].DBInstanceIdentifier'
-aws elbv2 describe-load-balancers --profile infra-aws --query 'LoadBalancers[].LoadBalancerName'
+export AWS_PROFILE=infra-aws
+
+echo "VPCs:        $(aws ec2 describe-vpcs --query 'length(Vpcs[?IsDefault==`false`])')"
+echo "NAT:         $(aws ec2 describe-nat-gateways --query 'length(NatGateways[?State!=`deleted`])')"
+echo "IPs fijas:   $(aws ec2 describe-addresses --query 'length(Addresses)')"
+echo "Balanceador: $(aws elbv2 describe-load-balancers --query 'length(LoadBalancers)')"
+echo "RDS:         $(aws rds describe-db-instances --query 'length(DBInstances)')"
+echo "ECS:         $(aws ecs list-clusters --query 'length(clusterArns)')"
+echo "ECR:         $(aws ecr describe-repositories --query 'length(repositories)')"
+echo "Logs:        $(aws logs describe-log-groups --log-group-name-prefix /ecs/ --query 'length(logGroups)')"
+echo "Buckets:     $(aws s3api list-buckets --query 'length(Buckets[?starts_with(Name,`tfstate-`)])')"
+echo "DynamoDB:    $(aws dynamodb list-tables --query 'length(TableNames)')"
 ```
 
-Las tres deberían salir vacías.
+Todo debe salir en `0`.
+
+Las **IPs fijas** son el olvido más caro y el más frecuente: una Elastic IP sin
+asociar a nada sigue costando ~3,60 USD al mes precisamente *por* estar ociosa.
+AWS cobra por reservarla, no por usarla.
+
+El secreto de la base de datos desaparece con la instancia, porque lo gestiona
+RDS y no Terraform. Si lo hubieras creado tú con `aws_secretsmanager_secret`,
+quedaría en cuarentena 30 días antes de borrarse de verdad.
+
+### 4. Después
+
+Las variables del repositorio en GitHub (`TF_STATE_BUCKET`, `AWS_ROLE_ARN`…)
+quedan apuntando a recursos que ya no existen. No cuesta nada dejarlas, y
+volver a levantar el ambiente solo requiere actualizarlas con los nuevos
+valores. El usuario de IAM y su llave sobreviven: son el único recurso creado a
+mano, y son los que te permiten volver a empezar.
 
 ---
 
@@ -590,7 +722,7 @@ Las tres deberían salir vacías.
       gestionadas por AWS en Secrets Manager.
 - [x] **Fase 4 — Cómputo y balanceo.** ECR, ECS Fargate, ALB, health checks,
       auto scaling.
-- [ ] **Fase 5 — GitOps.** `plan` comentado en cada PR, `apply` tras aprobación
-      manual en merge.
-- [ ] **Fase 6 — Documentación y evidencia.** Capturas del flujo completo de un
-      PR de infraestructura.
+- [x] **Fase 5 — GitOps.** `plan` comentado en cada PR, `apply` tras aprobación
+      manual en merge, autenticación OIDC sin secretos.
+- [x] **Fase 6 — Documentación y evidencia.** Decisiones justificadas,
+      instrucciones de arranque y de destrucción verificadas.

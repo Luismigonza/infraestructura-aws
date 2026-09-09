@@ -5,3 +5,16 @@ budget_alert_email = "tu-correo@ejemplo.com"
 aws_profile        = "infra-aws"
 aws_region         = "us-east-1"
 monthly_budget_usd = "10"
+
+# --- GitHub Actions ---
+# Los IDs numericos NO son opcionales: GitHub emite el sujeto del token OIDC
+# como `repo:owner@<owner_id>/repo@<repo_id>:contexto`. Si no coinciden, la
+# autenticacion falla con "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+#
+# Obtenlos con:
+#   gh api repos/OWNER/REPO --jq '"owner_id=\(.owner.id) repo_id=\(.id)"'
+
+github_owner    = "tu-usuario"
+github_repo     = "infraestructura-aws"
+github_owner_id = "000000000"
+github_repo_id  = "0000000000"
