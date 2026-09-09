@@ -1,0 +1,243 @@
+# ---------------------------------------------------------------------------
+# GitOps de infraestructura
+# ---------------------------------------------------------------------------
+# Dos trabajos con el mismo codigo y permisos muy distintos:
+#
+#   plan   -> corre en cada Pull Request y publica el resultado como comentario
+#             para que se pueda revisar ANTES de aprobar.
+#   apply  -> corre al fusionar a main, pero se detiene en un entorno protegido
+#             hasta que una persona lo aprueba a mano.
+#
+# Ninguno de los dos usa una llave de AWS. Se autentican por OIDC: GitHub firma
+# un token que dice quien es, AWS lo verifica y entrega credenciales que
+# caducan en una hora. No hay ningun secreto guardado en el repositorio.
+# ---------------------------------------------------------------------------
+
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "bootstrap/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+
+# Nunca dos operaciones sobre el mismo estado a la vez. Sin esto, dos merges
+# seguidos lanzarian dos apply en paralelo y el segundo se estrellaria contra
+# el cerrojo de DynamoDB. `cancel-in-progress: false` es deliberado: cancelar
+# un apply a media ejecucion deja recursos creados que el estado desconoce.
+concurrency:
+  group: terraform-estado-infra
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.15.8"
+  WORKDIR: infra
+
+jobs:
+  # =========================================================================
+  # PLAN: se ejecuta en cada Pull Request
+  # =========================================================================
+  plan:
+    if: github.event_name == 'pull_request'
+    name: Plan
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write # imprescindible: permite pedir el token OIDC
+      contents: read
+      pull-requests: write # para poder escribir el comentario
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Aqui ocurre la magia de OIDC. La action pide el token a GitHub, se lo
+      # presenta a AWS, y AWS devuelve credenciales temporales. Nada de esto
+      # pasa por un secreto del repositorio.
+      - name: Autenticarse en AWS por OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-plan-${{ github.run_id }}
+
+      # backend.hcl no se versiona porque es especifico de cada cuenta, asi que
+      # aqui los valores llegan como variables del repositorio.
+      - name: Inicializar
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Plan
+        id: plan
+        # continue-on-error para que un plan fallido igualmente publique el
+        # comentario con el motivo. El paso final vuelve a marcar el fallo.
+        continue-on-error: true
+        run: |
+          terraform plan -input=false -no-color -out tfplan 2>&1 | tee plan-completo.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+          # El log del workflow conserva la salida integra. El comentario del
+          # PR se queda solo con lo que hay que revisar: las lineas de
+          # "Refreshing state" son ruido de progreso, y en un stack con decenas
+          # de recursos entierran los cambios reales.
+          grep -vE ': (Refreshing state|Reading)\.\.\.$|: Read complete after'             plan-completo.txt > plan.txt || cp plan-completo.txt plan.txt
+
+      - name: Publicar el plan en el Pull Request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('infra/plan.txt', 'utf8');
+
+            // Un comentario de GitHub admite 65.536 caracteres. Un plan grande
+            // los supera, asi que se recorta conservando el FINAL, que es donde
+            // esta el resumen ("Plan: N to add...").
+            const LIMITE = 60000;
+            if (plan.length > LIMITE) {
+              plan = '...(recortado; consulta el log completo del workflow)...\n'
+                   + plan.slice(-LIMITE);
+            }
+
+            const ok = '${{ steps.plan.outputs.exitcode }}' === '0';
+            const cuerpo = [
+              `### ${ok ? 'Plan de Terraform' : 'El plan de Terraform fallo'}`,
+              '',
+              `Commit \`${context.sha.slice(0, 7)}\` · [ver ejecucion completa](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              '',
+              '<details><summary>Desplegar el plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Busca un comentario previo del bot y lo ACTUALIZA en vez de
+            // apilar uno nuevo por cada push. Un PR con quince commits no
+            // deberia tener quince planes que hay que ir descartando.
+            const marca = '### Plan de Terraform';
+            const marcaError = '### El plan de Terraform fallo';
+            const previos = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mio = previos.data.find(c =>
+              c.user.type === 'Bot' &&
+              (c.body.startsWith(marca) || c.body.startsWith(marcaError))
+            );
+
+            if (mio) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mio.id, body: cuerpo,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body: cuerpo,
+              });
+            }
+
+      - name: Fallar si el plan fallo
+        if: steps.plan.outputs.exitcode != '0'
+        run: exit 1
+
+  # =========================================================================
+  # APPLY: se ejecuta al fusionar a main, tras aprobacion manual
+  # =========================================================================
+  apply:
+    if: github.event_name == 'push'
+    name: Apply
+    runs-on: ubuntu-latest
+
+    # ESTA LINEA ES LA PUERTA.
+    #
+    # El entorno `produccion` esta configurado en GitHub con revisores
+    # obligatorios. El job queda en espera y NO recibe credenciales de AWS
+    # hasta que una persona pulsa "Approve". Sin esto, un merge tocaria la
+    # infraestructura real sin que nadie lo confirmara.
+    environment:
+      name: produccion
+      url: ${{ steps.salidas.outputs.app_url }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Autenticarse en AWS por OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-apply-${{ github.run_id }}
+
+      - name: Inicializar
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=infra/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      # Se vuelve a planificar y se aplica ESE archivo, en vez de un
+      # `apply -auto-approve` que recalcularia el plan por dentro. La diferencia
+      # importa: garantiza que lo aplicado es exactamente lo que se acaba de
+      # calcular, y el plan queda impreso en el log justo antes de ejecutarse.
+      - name: Plan
+        run: terraform plan -input=false -no-color -out tfplan
+
+      - name: Apply
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Recoger las salidas
+        id: salidas
+        run: |
+          echo "app_url=$(terraform output -raw app_url)" >> "$GITHUB_OUTPUT"
+
+      - name: Resumen
+        run: |
+          {
+            echo "## Infraestructura aplicada"
+            echo ""
+            echo "| Salida | Valor |"
+            echo "|---|---|"
+            echo "| URL de la aplicacion | ${{ steps.salidas.outputs.app_url }} |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

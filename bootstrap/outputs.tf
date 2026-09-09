@@ -17,3 +17,12 @@ output "siguiente_paso" {
   description = "Que hacer despues de aplicar el bootstrap."
   value       = "Se genero infra/backend.hcl. Ahora: cd ../infra && terraform init -backend-config=backend.hcl"
 }
+
+output "github_actions_role_arn" {
+  description = <<-EOT
+    Rol que asume GitHub Actions. Se configura como variable del repositorio:
+
+      gh variable set AWS_ROLE_ARN --body "<este valor>"
+  EOT
+  value       = aws_iam_role.github_actions.arn
+}

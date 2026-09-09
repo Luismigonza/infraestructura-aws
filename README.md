@@ -5,7 +5,7 @@ Nada se crea a mano en la consola: si no está en un archivo `.tf`, no existe.
 Los cambios de infraestructura se revisan en Pull Requests igual que el código
 de una aplicación, y se aplican solos cuando alguien los aprueba.
 
-> **Estado:** en construcción. Fases 1 y 2 de 6 completadas.
+> **Estado:** en construcción. Fases 1 a 4 de 6 completadas.
 > Ver [Hoja de ruta](#hoja-de-ruta).
 
 ---
@@ -144,6 +144,139 @@ Los endpoints de tipo **Gateway** son gratuitos (los de tipo *Interface* cuestan
 ~0,01 USD/hora por AZ). El tráfico hacia S3 deja de atravesar el NAT y deja de
 generar cargo.
 
+### La contraseña de la base de datos no existe en ninguna parte tuya
+
+La forma que enseñan casi todos los tutoriales:
+
+```hcl
+resource "random_password" "db" { length = 32 }
+resource "aws_db_instance" "main" { password = random_password.db.result }
+```
+
+Funciona, y tiene un agujero: `random_password` guarda el valor **en texto
+plano dentro del estado de Terraform**, que vive en S3. Cualquiera con permiso
+de lectura sobre ese bucket la ve.
+
+Aquí se usa `manage_master_user_password = true`: RDS la genera él mismo, la
+guarda en Secrets Manager y Terraform nunca la ve. Comprobado sobre el estado
+real:
+
+```
+Tamaño del estado                : 49.012 caracteres
+Atributos con valor de contraseña: 1
+  ('aws_db_instance', 'this', 'manage_master_user_password', 'True')
+```
+
+El único acierto es el propio booleano. De regalo, como AWS es dueño del
+secreto, la rotación automática viene activada sin configurar nada.
+
+### El "pase de entrada" a la base de datos
+
+El enunciado pide que RDS solo acepte tráfico desde el Security Group de ECS.
+Pero ECS necesita el endpoint de la base de datos para arrancar, y la base de
+datos necesita el Security Group de ECS para su regla: cada uno depende del
+otro y Terraform no puede ordenar el grafo.
+
+La salida es que el módulo de base de datos exporta un **segundo Security Group
+vacío**, sin ninguna regla, que funciona como etiqueta. La regla dice «acepto
+conexiones de quien lleve este pase», y las tareas de ECS se lo cuelgan junto
+al suyo. La base de datos define su política de acceso sin conocer a sus
+clientes.
+
+Verificado sobre el ambiente real:
+
+```
+DesdeIP  DesdeSG                 Puerto
+None     sg-05de18c5204a2bcc6    5432
+```
+
+`DesdeIP: None` es lo importante: ni `0.0.0.0/0`, ni siquiera el CIDR de la VPC
+completa (que dejaría entrar a cualquier cosa lanzada ahí dentro por descuido).
+
+Y desde fuera, la base de datos sencillamente no está:
+
+```
+$ nslookup infra-aws-dev-postgres...rds.amazonaws.com
+Address: 10.42.3.59            <- IP privada, dentro de la VPC
+
+$ (conexión al puerto 5432 desde una máquina de casa)
+INALCANZABLE
+```
+
+### El health check no consulta la base de datos
+
+`/health` responde sin tocar PostgreSQL, a propósito. Si lo hiciera, una caída
+de RDS haría que el balanceador marcara todas las tareas como muertas y ECS las
+reemplazara en bucle: un problema de base de datos se convertiría en una caída
+total del servicio.
+
+El health check responde a «¿este proceso está vivo?», no a «¿está todo el
+sistema perfecto?». Para lo segundo está `/db`, que es diagnóstico y no una
+sonda.
+
+### Fargate y no EC2
+
+Con EC2 alquilas máquinas: pagas por ellas estén ocupadas o no, y te toca
+parchear el sistema operativo, vigilar el disco y gestionar el agente de ECS.
+Con Fargate declaras cuánta CPU y memoria necesita el contenedor y AWS pone el
+resto.
+
+EC2 gana cuando hay carga constante y alta, o cuando hace falta algo que Fargate
+no ofrece (GPUs, un kernel concreto). Nada de eso aplica aquí.
+
+### Dos roles de IAM para ECS, no uno
+
+- El rol de **ejecución** lo usa la infraestructura de ECS *antes* de que el
+  código arranque: descargar la imagen, escribir logs, leer el secreto.
+- El rol de **tarea** lo usa el código ya corriendo, para llamar a otras APIs.
+
+Separarlos significa que si alguien compromete la aplicación, **no hereda el
+permiso de leer secretos**: ese permiso lo tuvo el agente de ECS, no el proceso.
+El rol de tarea de este proyecto va deliberadamente vacío, porque la aplicación
+solo habla con PostgreSQL.
+
+### El primer despliegue tiene un orden obligatorio
+
+El servicio de ECS arranca tareas que descargan una imagen de ECR, pero ECR lo
+crea Terraform. Aplicar todo de una vez deja el servicio apuntando a una imagen
+inexistente y las tareas entran en bucle de fallos.
+
+```bash
+terraform apply -target module.compute.aws_ecr_repository.app   # 1
+docker build && docker push                                     # 2
+terraform apply                                                 # 3
+```
+
+`-target` está desaconsejado para uso rutinario, y con razón. Este es el caso
+excepcional para el que existe: romper un ciclo de arranque.
+
+### GitHub Actions entra a AWS sin ningún secreto
+
+Lo habitual es crear una llave de IAM y pegarla en los secretos del
+repositorio. Tres problemas: no caduca nunca, vive en un sistema que no
+controlas, y quien la extraiga puede usarla desde cualquier lugar del mundo.
+
+OIDC invierte la relación. GitHub firma un token que afirma *«soy el
+repositorio X, corriendo en la rama Y»*. AWS verifica la firma contra las claves
+públicas de GitHub y entrega credenciales **temporales de una hora**. No hay
+ningún secreto que robar, porque no hay ningún secreto.
+
+Lo que decide si esto es seguro o inútil es la condición de confianza. El error
+habitual es `repo:*:*`, que permitiría a **cualquier repositorio de GitHub**
+—el de un desconocido incluido— operar en tu cuenta. Aquí se enumeran tres
+situaciones y ninguna más:
+
+```
+repo:Luismigonza/infraestructura-aws:ref:refs/heads/main
+repo:Luismigonza/infraestructura-aws:pull_request
+repo:Luismigonza/infraestructura-aws:environment:produccion
+```
+
+El rol del pipeline usa **el mismo archivo de política** que el usuario local
+(`docs/iam-policy-terraform.json`). Si mañana se añade un servicio, se edita un
+solo sitio: no hay forma de que el pipeline y tu máquina se desincronicen sin
+que nadie lo note.
+
 ### Doble mecanismo de bloqueo del estado
 
 Sin cerrojo, dos `apply` simultáneos (tu máquina y el pipeline) parten de fotos
@@ -218,6 +351,69 @@ sirviendo **HTTP en el puerto 80**.
 No es una omisión: es una limitación asumida y documentada. Con un dominio, el
 cambio son unas veinte líneas (un `aws_acm_certificate`, su validación por DNS,
 y un listener en el 443 que redirige el 80).
+
+---
+
+## El flujo de GitOps
+
+Un cambio de infraestructura recorre exactamente el mismo camino que un cambio
+de código de aplicación:
+
+```
+rama  →  Pull Request  →  la CI valida  →  el plan se publica como comentario
+      →  revisión humana  →  merge  →  el apply ESPERA aprobación  →  se aplica
+```
+
+| Workflow | Se dispara | Qué hace | Credenciales |
+|---|---|---|---|
+| `terraform-ci.yml` | cualquier PR o push | `fmt -check` y `validate` sobre ambos stacks | Ninguna |
+| `terraform.yml` · `plan` | PR hacia `main` | Planifica y publica el resultado en el PR | OIDC, temporales |
+| `terraform.yml` · `apply` | merge a `main` | **Se detiene** en el entorno `produccion` hasta que un revisor aprueba | OIDC, tras aprobar |
+| `app-deploy.yml` | cambios en `app/` | Construye la imagen, la sube a ECR, redespliega en ECS | OIDC, temporales |
+
+Detalles que no son evidentes:
+
+- **El comentario del plan se actualiza, no se apila.** Un PR con quince
+  commits tendría si no quince planes que hay que ir descartando; así siempre
+  hay uno solo y es el vigente.
+- **`cancel-in-progress: false`** en el `apply`. Cancelar un `apply` a media
+  ejecución deja recursos creados que el estado desconoce: huérfanos que siguen
+  cobrando y que Terraform ya no sabe borrar. Es preferible encolar.
+- **El `apply` vuelve a planificar y aplica ese archivo**, en vez de un
+  `apply -auto-approve` que recalcularía el plan por dentro. Así lo aplicado es
+  exactamente lo calculado, y el plan queda impreso en el log justo antes de
+  ejecutarse.
+- **El despliegue de la aplicación va aparte del de infraestructura**, porque
+  son ritmos distintos. El código cambia a diario; la forma de la
+  infraestructura casi nunca. Mezclarlos obligaría a pasar por la aprobación
+  manual cada vez que se corrige una línea de la app.
+- **Rollback:** cada imagen se etiqueta también con el SHA del commit, así que
+  volver a una versión concreta es `terraform apply -var image_tag=<sha>`.
+
+### Configuración necesaria en GitHub
+
+Estos pasos se hacen una vez. Ninguno guarda un secreto.
+
+```bash
+# Entorno protegido con revisor obligatorio (requiere repo público en el plan gratuito)
+'{"reviewers":[{"type":"User","id":TU_ID_NUMERICO}]}'   | gh api --method PUT repos/OWNER/REPO/environments/produccion --input -
+
+# Variables del repositorio (valores que devuelve `terraform output`)
+gh variable set AWS_ROLE_ARN    --body "<github_actions_role_arn del bootstrap>"
+gh variable set AWS_REGION      --body "us-east-1"
+gh variable set TF_STATE_BUCKET --body "<state_bucket del bootstrap>"
+gh variable set TF_LOCK_TABLE   --body "<lock_table del bootstrap>"
+gh variable set ECR_REPOSITORY  --body "<nombre del repositorio de ECR>"
+gh variable set ECS_CLUSTER     --body "<ecs_cluster_name>"
+gh variable set ECS_SERVICE     --body "<ecs_service_name>"
+gh variable set APP_URL         --body "<app_url>"
+```
+
+> **Nota sobre el plan gratuito de GitHub:** las reglas de protección de
+> entornos solo están disponibles en repositorios **públicos** (en cualquier
+> plan) o en privados con GitHub Pro o superior. Este repositorio es público en
+> parte por esa razón. Los comentarios del plan muestran ARNs que incluyen el ID
+> de la cuenta de AWS, que no es una credencial y no sirve de nada sin llaves.
 
 ---
 
@@ -345,9 +541,9 @@ Las tres deberían salir vacías.
       estructura de módulos, usuario IAM acotado.
 - [x] **Fase 2 — Red.** VPC, subnets públicas y privadas en 2 AZ, Internet
       Gateway, NAT Gateway, tablas de rutas, endpoint de S3.
-- [ ] **Fase 3 — Base de datos.** RDS PostgreSQL, Security Groups, credenciales
-      en Secrets Manager.
-- [ ] **Fase 4 — Cómputo y balanceo.** ECR, ECS Fargate, ALB, health checks,
+- [x] **Fase 3 — Base de datos.** RDS PostgreSQL, Security Groups, credenciales
+      gestionadas por AWS en Secrets Manager.
+- [x] **Fase 4 — Cómputo y balanceo.** ECR, ECS Fargate, ALB, health checks,
       auto scaling.
 - [ ] **Fase 5 — GitOps.** `plan` comentado en cada PR, `apply` tras aprobación
       manual en merge.

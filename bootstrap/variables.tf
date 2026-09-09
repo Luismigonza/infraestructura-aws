@@ -36,3 +36,52 @@ variable "budget_alert_email" {
   description = "Correo que recibe las alertas de presupuesto."
   type        = string
 }
+
+# ---------------------------------------------------------------------------
+# GitHub Actions
+# ---------------------------------------------------------------------------
+
+variable "github_owner" {
+  description = "Usuario u organizacion duena del repositorio."
+  type        = string
+  default     = "Luismigonza"
+}
+
+variable "github_repo" {
+  description = "Nombre del repositorio autorizado a asumir el rol."
+  type        = string
+  default     = "infraestructura-aws"
+}
+
+variable "github_environment" {
+  description = <<-EOT
+    Nombre del entorno protegido de GitHub que exige aprobacion manual antes
+    de aplicar. Debe coincidir exactamente con el configurado en el
+    repositorio, o la condicion de confianza no encajara y el job fallara al
+    autenticarse.
+  EOT
+  type        = string
+  default     = "produccion"
+}
+
+variable "github_owner_id" {
+  description = <<-EOT
+    ID numerico del usuario u organizacion en GitHub.
+
+    GitHub emite el sujeto del token OIDC con identificadores inmutables:
+    `repo:owner@<owner_id>/repo@<repo_id>:contexto`. Si la politica de
+    confianza solo contempla el formato clasico, la autenticacion falla con
+    "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+
+    Como obtenerlo:
+      gh api repos/OWNER/REPO --jq '"\(.owner.id) \(.id)"'
+  EOT
+  type        = string
+  default     = "186343187"
+}
+
+variable "github_repo_id" {
+  description = "ID numerico del repositorio. Ver github_owner_id."
+  type        = string
+  default     = "1361743544"
+}
