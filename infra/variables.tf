@@ -117,9 +117,19 @@ variable "image_tag" {
 }
 
 variable "min_tasks" {
-  description = "Numero minimo de tareas del servicio."
+  description = <<-EOT
+    Numero minimo de tareas del servicio.
+
+    Con una sola tarea, si esa tarea muere o cae su zona de disponibilidad, el
+    servicio queda caido hasta que ECS levante otra: entre 60 y 90 segundos.
+    Con dos, ECS las reparte entre las dos zonas y la caida de una zona entera
+    deja el servicio en pie.
+
+    Tener subnets en dos AZ no da alta disponibilidad por si solo. Hacen falta
+    tareas EN esas dos AZ.
+  EOT
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "max_tasks" {
@@ -132,17 +142,22 @@ variable "db_backup_retention_days" {
   description = <<-EOT
     Dias que RDS conserva las copias de seguridad automaticas.
 
-    Es la variable que se cambia en la demostracion de la Fase 5: subirla es un
-    cambio de infraestructura realista, se aplica en caliente sin cortar el
-    servicio, y no cuesta dinero a este volumen de datos.
+    LIMITADO POR LA CAPA GRATUITA. Subirlo a 7 se intento y AWS lo rechazo:
 
-    Se sube de 1 a 7 dias: con un solo dia de retencion, un fallo detectado el
-    lunes por la manana ya no tiene copia del viernes a la que volver. Una
-    semana cubre el caso realista de "alguien noto el problema unos dias
-    despues".
+      FreeTierRestrictionError: The specified backup retention period
+      exceeds the maximum available to free tier customers.
+
+    Es una restriccion comercial de la cuenta, no del codigo. `terraform plan`
+    no puede anticiparla: solo compara la configuracion contra el estado, y no
+    conoce las politicas de facturacion de AWS. Solo aparece al aplicar.
+
+    Se deja en 1, que es el minimo distinto de cero y cumple el requisito del
+    enunciado de tener copias activadas. En una cuenta de pago, 7 dias seria lo
+    razonable: con un solo dia, un fallo detectado el lunes por la manana ya no
+    tiene copia del viernes a la que volver.
   EOT
   type        = number
-  default     = 7
+  default     = 1
 
   validation {
     condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35

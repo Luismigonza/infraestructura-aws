@@ -250,6 +250,51 @@ terraform apply                                                 # 3
 `-target` está desaconsejado para uso rutinario, y con razón. Este es el caso
 excepcional para el que existe: romper un ciclo de arranque.
 
+### Lo que un `plan` no puede anticipar
+
+Al probar el flujo de GitOps se intentó subir la retención de copias de RDS de
+1 a 7 días. El `plan` salió limpio (`~ backup_retention_period = 1 -> 7`,
+actualización en sitio) y el `apply` falló:
+
+```
+FreeTierRestrictionError: The specified backup retention period exceeds
+the maximum available to free tier customers.
+```
+
+Es una restricción **comercial** de la cuenta, no del código. `terraform plan`
+compara la configuración contra el estado y consulta la API para refrescar,
+pero no conoce las políticas de facturación de AWS. Hay una clase de fallos que
+solo aparece al aplicar, y por eso importan tanto dos cosas que ya estaban en
+el diseño:
+
+- El **`apply` detenido tras aprobación manual**, para que un fallo así ocurra
+  cuando alguien está mirando.
+- Que un `apply` fallido **no deje el sistema roto**. Se verificó: la base de
+  datos siguió `available`, la aplicación siguió respondiendo `HTTP 200` y el
+  cerrojo del estado se liberó correctamente.
+
+Hubo, eso sí, una consecuencia sutil: el estado quedó anotando `7` mientras AWS
+seguía en `1`. Si el estado fuera la verdad, el siguiente `plan` habría dicho
+«todo en orden» y el cambio nunca se habría aplicado sin que nadie lo notara.
+No ocurre porque **`terraform plan` refresca contra AWS antes de comparar**: el
+estado es una caché, no la fuente de verdad. El plan siguiente volvió a mostrar
+`1 -> 7` correctamente.
+
+La retención se dejó en 1 día —el mínimo distinto de cero, que cumple el
+requisito de tener copias activadas— con la limitación documentada en
+`infra/variables.tf`.
+
+### Dos tareas mínimas, no una
+
+Tener subnets en dos zonas de disponibilidad **no da alta disponibilidad por sí
+solo**. Hacen falta tareas *en* esas dos zonas.
+
+Con `min_tasks = 1`, si esa única tarea muere o cae su AZ, el servicio queda
+caído entre 60 y 90 segundos hasta que ECS levante otra. Con 2, ECS las reparte
+entre `us-east-1a` y `us-east-1b` y la caída de una zona entera deja el
+servicio en pie. El costo añadido es una tarea de 0,25 vCPU: unos 0,012 USD por
+hora.
+
 ### GitHub Actions entra a AWS sin ningún secreto
 
 Lo habitual es crear una llave de IAM y pegarla en los secretos del
