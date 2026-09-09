@@ -490,6 +490,71 @@ gh variable set APP_URL         --body "<app_url>"
 
 ---
 
+## Evidencia
+
+El recorrido completo de un cambio de infraestructura, desde que se propone
+hasta que toca AWS.
+
+### 1. El plan se publica en el Pull Request
+
+![Plan comentado en el Pull Request](docs/img/1-plan-en-pr.png)
+
+GitHub Actions se autentica en AWS por OIDC, calcula el plan y lo deja como
+comentario. Fíjate en `Terraform / Apply — Skipped`: en un Pull Request el
+`apply` ni siquiera se ejecuta. Solo se mira, no se toca.
+
+### 2. El apply se detiene y espera a una persona
+
+![Despliegue esperando aprobación](docs/img/2-esperando-aprobacion.png)
+
+El cambio ya está fusionado en `main` y el workflow arrancó, pero el estado es
+**`Waiting`**. Ese job todavía **no tiene credenciales de AWS**: GitHub no se
+las entrega hasta que alguien autoriza. No es un aviso que se pueda ignorar; es
+una puerta cerrada.
+
+### 3. Queda registrado quién autorizó
+
+![Aprobación registrada](docs/img/3-aprobacion-registrada.png)
+
+La aprobación no es un clic que se pierde: queda como evento del despliegue, con
+autor y momento. Es la diferencia entre una convención de equipo y un control
+auditable.
+
+### 4. Se aplica, y se sabe exactamente qué
+
+![Apply completado](docs/img/4-apply-completado.png)
+
+El resumen registra la URL resultante y el SHA del commit aplicado. Cualquiera
+puede responder «¿qué versión está corriendo?» sin adivinar.
+
+### 5. La aplicación responde, y llega hasta la base de datos
+
+![La aplicación respondiendo](docs/img/5-app-respondiendo.png)
+
+`"conectado": true` con la versión de PostgreSQL significa que la petición viajó
+desde internet al balanceador, de ahí a una tarea de Fargate en una subnet
+privada, y de ahí a RDS en otra subnet privada — con una credencial que ningún
+humano ha visto.
+
+El aviso **«Not secure»** del navegador no es un descuido: es la decisión de
+[servir por HTTP](#http-no-https-decisión-pendiente-de-revisar) al no disponer
+de un dominio propio, visible en lugar de escondida.
+
+### 6. Dos tareas, dos zonas de disponibilidad
+
+![Dos tareas en dos zonas](docs/img/6-dos-tareas-dos-zonas.png)
+
+`En ejecución: 2`, una en `us-east-1a` y otra en `us-east-1b`. Tener subnets en
+dos zonas no da alta disponibilidad por sí solo: hacen falta tareas *en* esas
+zonas.
+
+La tercera fila, en `Detenido`, es la tarea única que existía antes de este
+cambio. ECS levantó las dos nuevas, esperó a que el balanceador las diera por
+sanas, y solo entonces retiró la vieja. El servicio no dejó de responder en
+ningún momento.
+
+---
+
 ## Costos
 
 | Recurso | Costo aproximado |
