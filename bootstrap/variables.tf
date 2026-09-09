@@ -63,3 +63,25 @@ variable "github_environment" {
   type        = string
   default     = "produccion"
 }
+
+variable "github_owner_id" {
+  description = <<-EOT
+    ID numerico del usuario u organizacion en GitHub.
+
+    GitHub emite el sujeto del token OIDC con identificadores inmutables:
+    `repo:owner@<owner_id>/repo@<repo_id>:contexto`. Si la politica de
+    confianza solo contempla el formato clasico, la autenticacion falla con
+    "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+
+    Como obtenerlo:
+      gh api repos/OWNER/REPO --jq '"\(.owner.id) \(.id)"'
+  EOT
+  type        = string
+  default     = "186343187"
+}
+
+variable "github_repo_id" {
+  description = "ID numerico del repositorio. Ver github_owner_id."
+  type        = string
+  default     = "1361743544"
+}

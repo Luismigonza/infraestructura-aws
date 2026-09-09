@@ -32,8 +32,42 @@ resource "aws_iam_openid_connect_provider" "github" {
 # Esta es la parte que de verdad importa. Un error habitual es poner
 # `repo:*:*`, que permitiria a CUALQUIER repositorio de GitHub —el de un
 # desconocido incluido— asumir este rol y operar en tu cuenta de AWS.
-#
-# Aqui se enumeran tres situaciones concretas y ninguna mas:
+locals {
+  # DOS FORMATOS DEL MISMO SUJETO.
+  #
+  # El formato clasico, el que aparece en practicamente toda la documentacion:
+  #
+  #   repo:Luismigonza/infraestructura-aws:pull_request
+  #
+  # Y el formato INMUTABLE, que GitHub emite desde que introdujo los
+  # identificadores numericos:
+  #
+  #   repo:Luismigonza@186343187/infraestructura-aws@1361743544:pull_request
+  #
+  # La diferencia no es cosmetica. Con el formato clasico, si este repositorio
+  # se borrara y otra persona creara uno con el mismo nombre bajo un usuario
+  # llamado igual, su pipeline encajaria con esta politica y podria operar en
+  # esta cuenta de AWS. Los IDs numericos no se pueden reclamar: son unicos
+  # para siempre.
+  #
+  # Se aceptan los dos porque no todas las cuentas emiten todavia el formato
+  # inmutable, y asi este codigo funciona en cualquiera sin editarlo.
+  gh_sujeto_clasico   = "repo:${var.github_owner}/${var.github_repo}"
+  gh_sujeto_inmutable = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
+
+  # Las tres unicas situaciones autorizadas.
+  gh_contextos = [
+    "ref:refs/heads/main",                   # push a main: donde corre el apply
+    "pull_request",                          # donde corre el plan
+    "environment:${var.github_environment}", # tras la aprobacion manual
+  ]
+
+  gh_sujetos = concat(
+    [for c in local.gh_contextos : "${local.gh_sujeto_clasico}:${c}"],
+    [for c in local.gh_contextos : "${local.gh_sujeto_inmutable}:${c}"],
+  )
+}
+
 data "aws_iam_policy_document" "github_confianza" {
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -55,18 +89,7 @@ data "aws_iam_policy_document" "github_confianza" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        # Un push a la rama principal: es donde corre el apply.
-        "repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/main",
-
-        # Un Pull Request: es donde corre el plan. Solo lectura en la practica,
-        # pero necesita escribir el cerrojo del estado.
-        "repo:${var.github_owner}/${var.github_repo}:pull_request",
-
-        # Un job que corre dentro del entorno protegido, es decir, despues de
-        # que una persona haya aprobado el despliegue a mano.
-        "repo:${var.github_owner}/${var.github_repo}:environment:${var.github_environment}",
-      ]
+      values   = local.gh_sujetos
     }
   }
 }
