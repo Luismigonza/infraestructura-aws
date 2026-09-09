@@ -66,6 +66,26 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # PASO TEMPORAL DE DIAGNOSTICO.
+      #
+      # Imprime las afirmaciones del token que GitHub emite, para poder
+      # compararlas con la condicion de confianza del rol en AWS. Solo muestra
+      # `sub`, `aud` y `repository`: son identificadores, no credenciales. La
+      # firma del token, que es lo unico sensible, no se toca.
+      - name: Diagnostico OIDC
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com');
+            const carga = JSON.parse(
+              Buffer.from(token.split('.')[1], 'base64url').toString()
+            );
+            core.info(`sub        = ${carga.sub}`);
+            core.info(`aud        = ${carga.aud}`);
+            core.info(`repository = ${carga.repository}`);
+            core.info(`ref        = ${carga.ref}`);
+            core.info(`event_name = ${carga.event_name}`);
+
       # Aqui ocurre la magia de OIDC. La action pide el token a GitHub, se lo
       # presenta a AWS, y AWS devuelve credenciales temporales. Nada de esto
       # pasa por un secreto del repositorio.
