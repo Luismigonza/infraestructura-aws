@@ -101,7 +101,10 @@ jobs:
           # PR se queda solo con lo que hay que revisar: las lineas de
           # "Refreshing state" son ruido de progreso, y en un stack con decenas
           # de recursos entierran los cambios reales.
-          grep -vE ': (Refreshing state|Reading)\.\.\.$|: Read complete after'             plan-completo.txt > plan.txt || cp plan-completo.txt plan.txt
+          # Las lineas de refresco terminan en "[id=vpc-0abc...]", no en los
+          # puntos suspensivos, de ahi que el patron no lleve ancla de fin.
+          grep -vE ': (Refreshing state|Reading)\.\.\.|: Read complete after' \
+            plan-completo.txt > plan.txt || cp plan-completo.txt plan.txt
 
       - name: Publicar el plan en el Pull Request
         uses: actions/github-script@v7
