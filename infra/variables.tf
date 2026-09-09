@@ -78,3 +78,69 @@ variable "single_nat_gateway" {
   type        = bool
   default     = true
 }
+
+# ---------------------------------------------------------------------------
+# Base de datos
+# ---------------------------------------------------------------------------
+
+variable "db_engine_version" {
+  description = "Version de PostgreSQL en RDS."
+  type        = string
+  default     = "17.11"
+}
+
+variable "db_instance_class" {
+  description = <<-EOT
+    Tamano de la instancia de RDS. db.t3.micro entra en la capa gratuita.
+
+    Esta es la variable que se cambia en la Fase 5 para demostrar el flujo
+    completo de un Pull Request de infraestructura de punta a punta.
+  EOT
+  type        = string
+  default     = "db.t3.micro"
+}
+
+# ---------------------------------------------------------------------------
+# Aplicacion
+# ---------------------------------------------------------------------------
+
+variable "container_port" {
+  description = "Puerto en el que escucha la aplicacion dentro del contenedor."
+  type        = number
+  default     = 8080
+}
+
+variable "image_tag" {
+  description = "Etiqueta de la imagen a desplegar. El pipeline la sobreescribe con el SHA del commit."
+  type        = string
+  default     = "latest"
+}
+
+variable "min_tasks" {
+  description = "Numero minimo de tareas del servicio."
+  type        = number
+  default     = 1
+}
+
+variable "max_tasks" {
+  description = "Numero maximo de tareas del servicio."
+  type        = number
+  default     = 3
+}
+
+variable "db_backup_retention_days" {
+  description = <<-EOT
+    Dias que RDS conserva las copias de seguridad automaticas.
+
+    Es la variable que se cambia en la demostracion de la Fase 5: subirla es un
+    cambio de infraestructura realista, se aplica en caliente sin cortar el
+    servicio, y no cuesta dinero a este volumen de datos.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
+    error_message = "Entre 1 y 35. Cero desactivaria las copias, y el enunciado las exige."
+  }
+}

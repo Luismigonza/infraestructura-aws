@@ -1,0 +1,16 @@
+{
+  "name": "infra-aws-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API minima para demostrar la infraestructura de punta a punta",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

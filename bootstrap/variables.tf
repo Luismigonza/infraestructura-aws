@@ -36,3 +36,30 @@ variable "budget_alert_email" {
   description = "Correo que recibe las alertas de presupuesto."
   type        = string
 }
+
+# ---------------------------------------------------------------------------
+# GitHub Actions
+# ---------------------------------------------------------------------------
+
+variable "github_owner" {
+  description = "Usuario u organizacion duena del repositorio."
+  type        = string
+  default     = "Luismigonza"
+}
+
+variable "github_repo" {
+  description = "Nombre del repositorio autorizado a asumir el rol."
+  type        = string
+  default     = "infraestructura-aws"
+}
+
+variable "github_environment" {
+  description = <<-EOT
+    Nombre del entorno protegido de GitHub que exige aprobacion manual antes
+    de aplicar. Debe coincidir exactamente con el configurado en el
+    repositorio, o la condicion de confianza no encajara y el job fallara al
+    autenticarse.
+  EOT
+  type        = string
+  default     = "produccion"
+}

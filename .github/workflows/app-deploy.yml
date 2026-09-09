@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# Despliegue de la aplicacion
+# ---------------------------------------------------------------------------
+# Separado del workflow de infraestructura a proposito. Son dos ritmos
+# distintos: el codigo de la aplicacion cambia a diario, la forma de la
+# infraestructura casi nunca. Mezclarlos obligaria a pasar por la aprobacion
+# manual de infraestructura cada vez que se corrige una linea de la app.
+#
+# Reparto de responsabilidades:
+#   - Terraform define la FORMA del servicio (cuanta CPU, en que subnets, con
+#     que permisos). Es la fuente de verdad de la infraestructura.
+#   - Este workflow mueve el CONTENIDO: construye la imagen, la sube y le pide
+#     a ECS que reemplace las tareas por otras con la imagen nueva.
+# ---------------------------------------------------------------------------
+
+name: Desplegar aplicacion
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/app-deploy.yml"
+  workflow_dispatch: # permite lanzarlo a mano desde la interfaz de GitHub
+
+concurrency:
+  group: despliegue-app
+  cancel-in-progress: false
+
+jobs:
+  desplegar:
+    name: Construir, subir y desplegar
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Autenticarse en AWS por OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-deploy-${{ github.run_id }}
+
+      - name: Entrar en ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir y subir la imagen
+        env:
+          REGISTRO: ${{ steps.ecr.outputs.registry }}
+          REPO: ${{ vars.ECR_REPOSITORY }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Dos etiquetas para la MISMA imagen:
+          #
+          #   :<sha>   inmutable. Identifica exactamente que codigo se
+          #            construyo. Es a lo que se vuelve para revertir:
+          #            terraform apply -var image_tag=<sha>
+          #   :latest  movil. Es la que apunta la definicion de tarea, y es lo
+          #            que hace que un redespliegue recoja la version nueva sin
+          #            tener que modificar la infraestructura.
+          docker build \
+            -t "$REGISTRO/$REPO:$SHA" \
+            -t "$REGISTRO/$REPO:latest" \
+            ./app
+
+          docker push "$REGISTRO/$REPO:$SHA"
+          docker push "$REGISTRO/$REPO:latest"
+
+          echo "Imagen publicada: $REGISTRO/$REPO:$SHA"
+
+      # ECS no vigila el registro: hay que pedirle explicitamente que
+      # reemplace las tareas. Va sacando las viejas y metiendo nuevas de forma
+      # escalonada, asi que el servicio no deja de responder en ningun momento.
+      - name: Forzar el redespliegue en ECS
+        run: |
+          aws ecs update-service \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --service "${{ vars.ECS_SERVICE }}" \
+            --force-new-deployment \
+            --no-cli-pager \
+            --query 'service.deployments[0].{Estado:rolloutState,Deseadas:desiredCount}' \
+            --output table
+
+      # Espera a que el despliegue termine de verdad. Sin esto, el workflow
+      # saldria en verde con las tareas nuevas todavia arrancando, y un fallo
+      # apareceria despues sin que nadie lo relacionara con este despliegue.
+      #
+      # Si las tareas no llegan a estar sanas, el circuit breaker de ECS
+      # revierte solo a la version anterior y este paso falla: el servicio
+      # sigue en pie con la version buena y el pipeline lo reporta en rojo.
+      - name: Esperar a que el servicio se estabilice
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --services "${{ vars.ECS_SERVICE }}"
+          echo "Servicio estable."
+
+      - name: Resumen
+        run: |
+          {
+            echo "## Aplicacion desplegada"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Imagen | \`${{ github.sha }}\` |"
+            echo "| Servicio | \`${{ vars.ECS_SERVICE }}\` |"
+            echo "| URL | ${{ vars.APP_URL }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
