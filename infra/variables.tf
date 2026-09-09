@@ -65,3 +65,16 @@ variable "az_count" {
     error_message = "Entre 2 y 3. Menos de 2 rompe la alta disponibilidad; mas de 3 solo suma costo."
   }
 }
+
+variable "single_nat_gateway" {
+  description = <<-EOT
+    Un solo NAT Gateway compartido (true) o uno por zona de disponibilidad
+    (false). La justificacion completa esta en modules/network/variables.tf.
+
+    En una frase: un NAT cuesta ~32 USD/mes, y perderlo no tumba la
+    aplicacion, solo impide que las tareas inicien conexiones salientes.
+    Pagar el doble por eso en un ambiente efimero no se justifica.
+  EOT
+  type        = bool
+  default     = true
+}

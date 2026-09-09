@@ -18,6 +18,15 @@ locals {
   # (que es unico y no es secreto) resuelve el problema de forma determinista.
   state_bucket_name = "tfstate-${var.project_name}-${data.aws_caller_identity.current.account_id}"
   lock_table_name   = "tflock-${var.project_name}"
+
+  # El backend se autentica por su cuenta, aparte del provider: se inicializa
+  # antes de que las variables existan, asi que no puede leer var.aws_profile.
+  # Sin esta linea, `terraform init` en una maquina sin AWS_PROFILE en el
+  # entorno falla con "No valid credential sources found".
+  #
+  # En CI no hay perfil (las credenciales llegan por rol IAM), y ahi
+  # var.aws_profile es null: la linea simplemente no se emite.
+  backend_profile_line = var.aws_profile != null ? "profile        = \"${var.aws_profile}\"" : ""
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +219,7 @@ resource "local_file" "backend_config" {
     dynamodb_table = "${aws_dynamodb_table.tflock.name}"
     use_lockfile   = true
     encrypt        = true
+    ${local.backend_profile_line}
   EOT
 }
 
@@ -230,5 +240,6 @@ resource "local_file" "backend_config_bootstrap" {
     dynamodb_table = "${aws_dynamodb_table.tflock.name}"
     use_lockfile   = true
     encrypt        = true
+    ${local.backend_profile_line}
   EOT
 }
