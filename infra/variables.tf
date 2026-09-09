@@ -135,9 +135,14 @@ variable "db_backup_retention_days" {
     Es la variable que se cambia en la demostracion de la Fase 5: subirla es un
     cambio de infraestructura realista, se aplica en caliente sin cortar el
     servicio, y no cuesta dinero a este volumen de datos.
+
+    Se sube de 1 a 7 dias: con un solo dia de retencion, un fallo detectado el
+    lunes por la manana ya no tiene copia del viernes a la que volver. Una
+    semana cubre el caso realista de "alguien noto el problema unos dias
+    despues".
   EOT
   type        = number
-  default     = 1
+  default     = 7
 
   validation {
     condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
